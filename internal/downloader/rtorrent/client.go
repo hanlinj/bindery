@@ -18,7 +18,10 @@
 //     reachable from outside its host.
 //
 // Field mapping for DownloadClient storage:
-//   - Username/Password → HTTP basic auth on the RPC endpoint (HTTP only)
+//   - Username/Password → HTTP basic auth on the RPC endpoint (HTTP only); if
+//     the server answers 401 with a Digest challenge (common on seedbox
+//     ruTorrent installs) the request is retried with Digest and the scheme
+//     is remembered for later calls
 //   - URLBase           → the RPC path, or an scgi:// address; see New
 //   - Category          → the ruTorrent label, stored in d.custom1
 package rtorrent
@@ -33,8 +36,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/icholy/digest"
 
 	"github.com/vavallee/bindery/internal/downloader/clienthost"
 	"github.com/vavallee/bindery/internal/downloader/infohash"
@@ -88,6 +95,14 @@ type Client struct {
 	// pollInterval is the sleep between add-confirmation attempts. Overridden
 	// in tests so they do not spend three seconds confirming a torrent.
 	pollInterval time.Duration
+
+	// digestMode is set once a Digest challenge has been answered, so later
+	// calls go straight to Digest instead of paying a 401 round trip each time.
+	digestMode atomic.Bool
+	// digestOnce/digestHTTP lazily build the Digest-capable client. The
+	// digest.Transport caches the server's challenge (nonce) across calls.
+	digestOnce sync.Once
+	digestHTTP *http.Client
 }
 
 // rpcTimeout bounds a single RPC round trip on either transport. Generous
@@ -651,37 +666,107 @@ func (c *Client) call(ctx context.Context, method string, args ...arg) (*xmlValu
 		return nil, fmt.Errorf("rTorrent RPC URL is not configured")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("build rTorrent request: %w", err)
-	}
-	req.Header.Set("Content-Type", "text/xml")
-	req.Header.Set("Accept", "text/xml")
-	req.Header.Set("User-Agent", useragent.Get())
-	if c.username != "" || c.password != "" {
-		req.SetBasicAuth(c.username, c.password)
-	}
+	hasCreds := c.username != "" || c.password != ""
 
-	if err := c.validateRequestTarget(req.URL); err != nil {
+	// Scheme selection: Basic by default; Digest once the server has asked for
+	// it. A Digest challenge on a Basic attempt triggers one retry.
+	useDigest := c.digestMode.Load()
+	resp, body, err := c.post(ctx, method, payload, useDigest)
+	if err != nil {
 		return nil, err
 	}
-	resp, err := c.http.Do(req) // #nosec G107 G704 -- URL validated by validateRequestTarget; redirect policy enforced on client
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", method, err)
+	digestOffered := useDigest || offersDigest(resp.Header)
+	if resp.StatusCode == http.StatusUnauthorized && !useDigest && hasCreds && offersDigest(resp.Header) {
+		useDigest = true
+		resp, body, err = c.post(ctx, method, payload, true)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			c.digestMode.Store(true)
+		}
 	}
-	defer resp.Body.Close()
 
-	body, err := readRPCBody(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("rtorrent: read body: %w", err)
-	}
 	if resp.StatusCode == http.StatusUnauthorized {
+		if digestOffered {
+			return nil, fmt.Errorf("rTorrent rejected the credentials (HTTP 401) — the server requires HTTP Digest authentication; check the username and password for %s", c.baseURL)
+		}
 		return nil, fmt.Errorf("rTorrent rejected the credentials (HTTP 401) — check the username and password, and that the reverse proxy in front of %s is not requiring a different login", c.baseURL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("rTorrent HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 	return c.decode(method, body)
+}
+
+// post sends one RPC POST and returns the response (body already consumed and
+// closed) plus its body. The request body is a bytes.Reader, so net/http sets
+// GetBody and the Digest transport can replay it on its own challenge retry.
+func (c *Client) post(ctx context.Context, method string, payload []byte, useDigest bool) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build rTorrent request: %w", err)
+	}
+	req.Header.Set("Content-Type", "text/xml")
+	req.Header.Set("Accept", "text/xml")
+	req.Header.Set("User-Agent", useragent.Get())
+	hc := c.http
+	if useDigest {
+		hc = c.digestClient()
+	} else if c.username != "" || c.password != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
+	if err := c.validateRequestTarget(req.URL); err != nil {
+		return nil, nil, err
+	}
+	resp, err := hc.Do(req) // #nosec G107 G704 -- URL validated by validateRequestTarget; redirect policy enforced on client
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", method, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := readRPCBody(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rtorrent: read body: %w", err)
+	}
+	return resp, body, nil
+}
+
+// digestClient returns the client used for Digest-authenticated calls. It
+// shares the Basic client's timeout and redirect policy, and delegates to
+// c.http.Transport at call time so WrapTransport (metrics) still applies.
+func (c *Client) digestClient() *http.Client {
+	c.digestOnce.Do(func() {
+		c.digestHTTP = &http.Client{
+			Timeout:       c.http.Timeout,
+			CheckRedirect: c.checkRedirect,
+			Transport: &digest.Transport{
+				Username: c.username,
+				Password: c.password,
+				Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+					return c.http.Transport.RoundTrip(r)
+				}),
+			},
+		}
+	})
+	return c.digestHTTP
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// offersDigest reports whether a 401 response advertises Digest auth. A server
+// may list several WWW-Authenticate headers (Basic and Digest); any one starting
+// with "Digest" counts.
+func offersDigest(h http.Header) bool {
+	for _, v := range h.Values("WWW-Authenticate") {
+		if len(v) >= 6 && strings.EqualFold(v[:6], "Digest") {
+			return true
+		}
+	}
+	return false
 }
 
 // decode turns a raw reply into a value, translating a parse failure into the
